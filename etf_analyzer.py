@@ -47,16 +47,18 @@ def etf_analyze_investment(symbol: str = "515450", start_date: str = "20250101",
     # 遍历每个跌幅区间
     for i, (upper, lower) in enumerate(intervals):
         mask = (df_down['涨跌幅'] <= upper) & (df_down['涨跌幅'] > lower)
-        subset = df_down[mask]
+        subset = df_down[mask].copy()
 
-        invest_per_day = amounts[i]
-        total_invest = len(subset) * invest_per_day
+        # 计算每天的投资额：跌幅（绝对值） * 1000
+        subset['投资金额'] = subset['涨跌幅'].abs() * 1000
+        total_invest = subset['投资金额'].sum()
         total_invest_per_interval.append(total_invest)
 
         print(f"\n--- 跌幅区间：{upper:.1f}% 到 {lower:.1f}% ---")
-        print(f"共 {len(subset)} 天，单次投入：{invest_per_day} 元，总投入：{total_invest} 元")
+        print(f"共 {len(subset)} 天，总投入：{total_invest:.2f} 元")
         if not subset.empty:
             print(subset[['日期', '涨跌幅']].to_string(index=False))
+
 
     # 总投入汇总
     print(f"\n==== ETF[{symbol}]-总投入情况 ====")
