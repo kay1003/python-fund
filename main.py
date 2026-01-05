@@ -1,6 +1,6 @@
 import datetime
 
-from etf_analyzer import etf_analyze_investment
+from fund.etf_analyzer import etf_analyze_investment
 from stock_analyzer import stock_analyze_investment
 from us_analyzer import us_analyze_etf
 

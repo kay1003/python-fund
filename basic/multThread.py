@@ -1,5 +1,5 @@
 import threading, multiprocessing
-import datetime
+from datetime import *
 
 def loop():
     print(f'loop start name{threading.current_thread().name}')
@@ -8,9 +8,9 @@ def loop():
         x = x ^ 1
 
 
-for i in range(multiprocessing.cpu_count()):
-    threading.Thread(target=loop, name=f'kang{i}').start()
+# for i in range(multiprocessing.cpu_count()):
+#     threading.Thread(target=loop, name=f'kang{i}').start()
 
 threadLocal = threading.local
 
-print(datetime.datetime.now())
+print(datetime.now().astimezone(timezone(timedelta(hours=1))))
