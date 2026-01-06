@@ -13,8 +13,14 @@ def demo(text :str, temp1 :int, temp2):
     result = temp1+ temp2;
     print(f'Hello, {text}, result is {result}')
 
+def calculate_age(birth_date: datetime.date) -> int:
+    today = datetime.date.today()
+    age = today.year - birth_date.year
+    if (today.month, today.day) < (birth_date.month, birth_date.day):
+        age -= 1
+    return age
 
-# 按装订区域中的绿色按钮以运行脚本。
+# 按装订区域中的绿色按钮以运行脚本
 if __name__ == '__main__':
     # etf_analyze_investment("515450")
     # etf_analyze_investment(symbol="159545")
@@ -23,7 +29,7 @@ if __name__ == '__main__':
     years = 5
     daily, month_half, halfyear = us_analyze_etf("107.VOO", years)
 
-    print(f"\n📌 每日涨跌幅（最近 {years} 年）示例：")
+    print(f"\n📌 每日涨跌幅（最近 {years} 年）示例 ： ")
     print(daily.tail(10).to_string(index=False))
 
     print(f"\n📌 每月上下半月下跌概率（最近 {years} 年）：")
