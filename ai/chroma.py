@@ -17,6 +17,7 @@ def main():
         n_results=1 # how many results to return
     )
     print(results)
+    # autosave
     json_str = json.dumps(results, indent=2, ensure_ascii=False)
     print(type(json_str))
     print(json_str)
