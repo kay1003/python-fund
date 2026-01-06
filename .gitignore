@@ -20,3 +20,5 @@ bin-release/
 # dependency
 /.idea/
 /.venv/
+/.vscode/
+__pycache__/
