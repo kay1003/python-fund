@@ -7,5 +7,6 @@ requires-python = ">=3.13"
 dependencies = [
     "akshare>=1.18.8",
     "chromadb>=1.4.0",
+    "openai>=2.14.0",
     "pandas>=2.3.3",
 ]
