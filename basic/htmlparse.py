@@ -1,5 +1,4 @@
 from html.parser import HTMLParser
-from html.entities import name2codepoint
 
 class MyHTMLParser(HTMLParser):
     def handle_starttag(self, tag, attrs):
@@ -23,10 +22,18 @@ class MyHTMLParser(HTMLParser):
     def handle_charref(self, name):
         print('&#%s;' % name)
 
-parser = MyHTMLParser()
-parser.feed('''<html>
+
+def main() -> None:
+    parser = MyHTMLParser()
+    parser.feed(
+        """<html>
 <head></head>
 <body>
 <!-- test html parser -->
-    <p>Some <a href=\"#\">html</a> HTML&nbsp;tutorial...<br>END</p>
-</body></html>''')
+    <p>Some <a href="#">html</a> HTML&nbsp;tutorial...<br>END</p>
+</body></html>"""
+    )
+
+
+if __name__ == "__main__":
+    main()

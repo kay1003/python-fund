@@ -1,33 +1,40 @@
-import datetime
-
 import akshare as ak
-import pandas as pd
+
+from fund.utils import (
+    get_yesterday_str,
+    prepare_hist_df,
+    resolve_analysis_year,
+    summarize_intervals,
+)
 
 
-pd.set_option('display.max_rows', None)  # 显示所有行
-pd.set_option('display.max_columns', None)  # 显示所有列
 
-
-
-
-def etf_analyze_investment(symbol: str = "515450", start_date: str = "20250101", end_date: str = ""):
+def etf_analyze_investment(
+    symbol: str = "515450",
+    start_date: str = "20250101",
+    end_date: str = "",
+    analysis_year: int | None = None,
+):
     if not end_date:
-        end_date = get_yesterday()
+        end_date = get_yesterday_str()
 
     df = ak.fund_etf_hist_em(symbol=symbol, period="daily", start_date=start_date, end_date=end_date, adjust="qfq")
-    # 格式处理
-    df["日期"] = pd.to_datetime(df["日期"])
-    df = df.sort_values("日期").reset_index(drop=True)
+    df = prepare_hist_df(df)
 
     # 筛选出下跌交易日
-    df['涨跌幅'] = df['涨跌幅'].astype(float)
     df_down = df[df["涨跌幅"] < 0]
 
-    all = len(df[df['日期'].dt.year == 2025])
-    down = len(df_down[df_down['日期'].dt.year == 2025])
+    analysis_year = resolve_analysis_year(df, "日期", analysis_year)
+    year_mask = df["日期"].dt.year == analysis_year
+    all_days = int(year_mask.sum())
+    down_days = int((df_down["日期"].dt.year == analysis_year).sum())
+    down_rate = round(down_days / all_days * 100, 2) if all_days else 0.0
 
     # 统计并输出
-    print(f"ETF[{symbol}]-2025年全部交易日数量：{all}天，下跌交易日数量：{down}天。下跌率：{round(down / all * 100, 2)}%")
+    print(
+        f"ETF[{symbol}]-{analysis_year}年全部交易日数量：{all_days}天，"
+        f"下跌交易日数量：{down_days}天。下跌率：{down_rate}%"
+    )
     # 定义跌幅区间：[(上限, 下限)]
     intervals = [
         (-0.0, -0.5),
@@ -38,37 +45,18 @@ def etf_analyze_investment(symbol: str = "515450", start_date: str = "20250101",
         (-5.0, -10.0),
     ]
 
-    # 区间对应的投资金额（单位：元）
-    amounts = [500, 1000, 1500, 2000, 2500, 5000]
+    summaries = summarize_intervals(df_down, intervals, strategy="proportional", proportional_scale=1000.0)
 
-    # 用于汇总每个区间的总投资额
-    total_invest_per_interval = []
-
-    # 遍历每个跌幅区间
-    for i, (upper, lower) in enumerate(intervals):
-        mask = (df_down['涨跌幅'] <= upper) & (df_down['涨跌幅'] > lower)
-        subset = df_down[mask].copy()
-
-        # 计算每天的投资额：跌幅（绝对值） * 1000
-        subset['投资金额'] = subset['涨跌幅'].abs() * 1000
-        total_invest = subset['投资金额'].sum()
-        total_invest_per_interval.append(total_invest)
-
-        print(f"\n--- 跌幅区间：{upper:.1f}% 到 {lower:.1f}% ---")
-        print(f"共 {len(subset)} 天，总投入：{total_invest:.2f} 元")
-        if not subset.empty:
-            print(subset[['日期', '涨跌幅']].to_string(index=False))
+    for summary in summaries:
+        print(f"\n--- 跌幅区间：{summary.upper:.1f}% 到 {summary.lower:.1f}% ---")
+        print(f"共 {summary.days} 天，总投入：{summary.total_invest:.2f} 元")
+        if not summary.subset.empty:
+            print(summary.subset[["日期", "涨跌幅"]].to_string(index=False))
 
 
     # 总投入汇总
     print(f"\n==== ETF[{symbol}]-总投入情况 ====")
-    print(f"总投入：{sum(total_invest_per_interval)} 元")
-    for i, (upper, lower) in enumerate(intervals):
-        print(f"区间 {upper:.1f}% 到 {lower:.1f}%：投入 {total_invest_per_interval[i]} 元")
+    print(f"总投入：{sum(s.total_invest for s in summaries):.2f} 元")
+    for summary in summaries:
+        print(f"区间 {summary.upper:.1f}% 到 {summary.lower:.1f}%：投入 {summary.total_invest:.2f} 元")
     print(f"\n##########ETF[{symbol}] analyze end ################################################\n\n\n")
-
-def get_yesterday():
-    today = datetime.date.today()
-    oneday = datetime.timedelta(days=1)
-    yesterday = today - oneday
-    return yesterday.strftime('%Y%m%d')

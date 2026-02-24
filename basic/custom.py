@@ -11,7 +11,11 @@ class Chain(object):
     __repr__ = __str__
 
 
-var = Chain().status.user.timeline.list
-print(var)
+def main() -> None:
+    var = Chain().status.user.timeline.list
+    print(var)
+    print(callable("kang"))
 
-print(callable('kang'))
+
+if __name__ == "__main__":
+    main()

@@ -10,8 +10,11 @@ def us_analyze_etf(symbol: str = "107.VOO", years: int = 5):
     cutoff = datetime.now() - pd.DateOffset(years=years)
     df = df[df['日期'] >= cutoff].copy()
 
-    # 计算涨跌幅
-    # df['涨跌幅'] = df['收盘价'].pct_change()
+    # 计算涨跌幅（部分数据源可能没有该列）
+    if '涨跌幅' not in df.columns:
+        price_col = '收盘价' if '收盘价' in df.columns else '收盘'
+        if price_col in df.columns:
+            df['涨跌幅'] = df[price_col].pct_change() * 100
     df.dropna(inplace=True)
 
     # 添加辅助列
@@ -19,7 +22,10 @@ def us_analyze_etf(symbol: str = "107.VOO", years: int = 5):
     df['月份'] = df['日期'].dt.month
     df['日'] = df['日期'].dt.day
     df['上下半月'] = df['日'].apply(lambda x: '上半月' if x <= 15 else '下半月')
-    df['星期'] = df['日期'].dt.day_name(locale='zh_CN')
+    try:
+        df['星期'] = df['日期'].dt.day_name(locale='zh_CN')
+    except ValueError:
+        df['星期'] = df['日期'].dt.day_name()
     df['上下半年'] = df['月份'].apply(lambda m: '上半年' if m <= 6 else '下半年')
     df['是否下跌'] = df['涨跌幅'] < 0
 
