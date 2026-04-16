@@ -14,6 +14,9 @@ from ibapi.wrapper import EWrapper
 
 WATCHLIST_FILE = os.getenv("WATCHLIST_FILE", "watchlist_short.json")
 
+# 上次推送内容缓存文件（用于对比是否变化）
+LAST_PUSH_FILE = Path(__file__).parent / ".last_push.json"
+
 
 @dataclass
 class PositionRow:
@@ -86,7 +89,7 @@ class ReadOnlyIBApp(EWrapper, EClient):
         self._pnl_single_reqids: dict[int, str] = {}
 
     def nextValidId(self, orderId: int):
-        print(f"[INFO] 已连接 TWS, nextValidId={orderId}")
+        pass  # 正常连接不记录日志
 
     def managedAccounts(self, accountsList: str):
         self.accounts = [a.strip() for a in accountsList.split(",") if a.strip()]
@@ -96,8 +99,6 @@ class ReadOnlyIBApp(EWrapper, EClient):
             return
 
         self.account = self.accounts[0]
-        print(f"[INFO] 使用账户: {self.account}")
-
         self.reqAccountUpdates(True, self.account)
         self.reqPnL(self._pnl_req_id, self.account, "")
 
@@ -147,8 +148,6 @@ class ReadOnlyIBApp(EWrapper, EClient):
         self._pnl_received = True
 
     def accountDownloadEnd(self, accountName: str):
-        print(f"[INFO] 账户持仓下载完成: {accountName}")
-
         self._pnl_single_received = set()
         self._pnl_single_reqids = {}
 
@@ -156,7 +155,6 @@ class ReadOnlyIBApp(EWrapper, EClient):
             req_id = 8000 + i
             self._pnl_single_reqids[req_id] = symbol
             self.reqPnLSingle(req_id, self.account, "", row.conId)
-            print(f"[INFO] 订阅实时盈亏: {symbol} conId={row.conId} reqId={req_id}")
 
         expected = set(self.positions.keys())
 
@@ -179,18 +177,22 @@ class ReadOnlyIBApp(EWrapper, EClient):
         row = self.positions.get(symbol)
         if row:
             row.unrealizedPNL = float(unrealizedPnL)
-            print(f"[INFO] 实时盈亏更新: {symbol} unrealizedPNL={unrealizedPnL}")
 
         self._pnl_single_received.add(symbol)
 
     def error(self, reqId, errorCode, errorString, advancedOrderRejectJson=""):
+        # IB API 会把正常连接消息也走 error 回调，过滤掉这些
+        # 2104, 2106, 2158 是数据场连接正常的通知，不是错误
+        if errorCode in (2104, 2106, 2158):
+            return
         print(f"[ERROR] reqId={reqId}, code={errorCode}, msg={errorString}")
 
 
 def build_brief(app: ReadOnlyIBApp) -> tuple[str, str]:
     title = "持仓简报"
     lines = []
-    total = 0.0
+    total_pnl = 0.0
+    total_cost = 0.0
     found_any = False
 
     for symbol in app.watchlist_order:
@@ -199,27 +201,93 @@ def build_brief(app: ReadOnlyIBApp) -> tuple[str, str]:
             continue
 
         pnl = float(row.unrealizedPNL or 0.0)
-        total += pnl
+        avg_cost = float(row.averageCost or 0.0)
+        position = float(row.position or 0.0)
+        cost_basis = avg_cost * position  # 成本基础 = 均价 × 持仓数量
+        pnl_pct = (pnl / cost_basis * 100) if cost_basis > 0 else 0  # 收益率
+
+        total_pnl += pnl
+        total_cost += cost_basis
         found_any = True
         emoji = "📈" if pnl >= 0 else "📉"
-        lines.append(f"{emoji} **{symbol}** 未实现盈亏：${pnl:,.2f}")
+
+        lines.append(
+            f"{emoji} **{symbol}** 未实现盈亏：${pnl:,.2f} ({pnl_pct:+.2f}%)\n"
+            f"- 均价：${avg_cost:,.2f}\n"
+            f"- 成本基础：${cost_basis:,.2f}"
+        )
 
     if not found_any:
         lines.append("当前短线池无持仓")
-
-    lines.append(f"\n**合计：${total:,.2f}**")
+    else:
+        total_pnl_pct = (total_pnl / total_cost * 100) if total_cost > 0 else 0
+        lines.append(f"\n**💰 总成本基础：${total_cost:,.2f}**")
+        lines.append(f"**📊 总未实现盈亏：${total_pnl:,.2f} ({total_pnl_pct:+.2f}%)**")
 
     content = "\n\n".join(lines)
     return title, content
 
 
-def send_pushplus(title: str, content: str):
+def _load_last_push() -> dict:
+    """加载上次推送的内容摘要"""
+    if LAST_PUSH_FILE.exists():
+        try:
+            return json.loads(LAST_PUSH_FILE.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+    return {}
+
+
+def _save_last_push(summary: dict):
+    """保存本次推送的内容摘要"""
+    try:
+        LAST_PUSH_FILE.write_text(json.dumps(summary, ensure_ascii=False), encoding="utf-8")
+    except Exception:
+        pass  # 保存失败不记录日志
+
+
+def _build_content_summary(positions: dict, watchlist_order: list) -> dict:
+    """构建内容摘要，用于对比是否变化"""
+    summary = {}
+    for symbol in watchlist_order:
+        row = positions.get(symbol)
+        if row:
+            # 只取关键字段，避免浮点精度问题
+            summary[symbol] = {
+                "position": round(float(row.position), 4),
+                "averageCost": round(float(row.averageCost or 0), 2),
+                "unrealizedPNL": round(float(row.unrealizedPNL or 0), 2),
+            }
+    return summary
+
+
+def _has_content_changed(positions: dict, watchlist_order: list) -> bool:
+    """检查持仓内容是否发生变化"""
+    current = _build_content_summary(positions, watchlist_order)
+    last = _load_last_push()
+
+    if not last:
+        return True
+
+    if current != last:
+        return True
+
+    return False
+
+
+def send_pushplus(title: str, content: str, positions: dict = None, watchlist_order: list = None):
+    """发送 PushPlus 推送，支持内容变化检测"""
     token = os.getenv("PUSHPLUS_TOKEN", "").strip()
     topic = os.getenv("PUSHPLUS_TOPIC", "").strip()
 
     if not token:
         print("[WARN] 未设置 PUSHPLUS_TOKEN，跳过推送")
         return
+
+    # 内容变化检测
+    if positions is not None and watchlist_order is not None:
+        if not _has_content_changed(positions, watchlist_order):
+            return
 
     url = "https://www.pushplus.plus/send"
     payload = {
@@ -243,28 +311,23 @@ def send_pushplus(title: str, content: str):
     try:
         with urllib.request.urlopen(req, timeout=15) as resp:
             body = resp.read().decode("utf-8", errors="replace")
-            print("[INFO] PushPlus 返回:", body)
+            # 推送成功后保存内容摘要
+            if positions is not None and watchlist_order is not None:
+                _save_last_push(_build_content_summary(positions, watchlist_order))
+            # 检查返回结果，非成功状态记录错误
+            try:
+                result = json.loads(body)
+                if result.get("code") != 200:
+                    print(f"[ERROR] PushPlus 推送异常: {body}")
+            except Exception:
+                pass
     except Exception as e:
         print(f"[ERROR] PushPlus 推送失败: {e}")
 
 
 def print_console_summary(app: ReadOnlyIBApp, title: str, content: str):
-    print("\n===== 控制台预览 =====")
-    print(title)
-    print(content)
-
-    if app.positions:
-        print("\n当前纳入监控的持仓:")
-        for symbol in app.watchlist_order:
-            row = app.positions.get(symbol)
-            if not row:
-                continue
-            print(
-                f"{symbol} | 数量={row.position} | 市价={row.marketPrice} | "
-                f"未实现盈亏={row.unrealizedPNL}"
-            )
-    else:
-        print("\n当前监控池没有持仓")
+    # 控制台不输出，所有信息通过 PushPlus 推送
+    pass
 
 
 def run_readonly_report(
@@ -274,7 +337,6 @@ def run_readonly_report(
     timeout_seconds: int = 20,
 ):
     watchlist = load_watchlist(WATCHLIST_FILE)
-    print("[INFO] 短线监控池:", ", ".join(watchlist))
 
     app = ReadOnlyIBApp(watchlist=watchlist)
     app.connect(host, port, client_id)
@@ -311,7 +373,7 @@ def run_readonly_report(
 
     title, content = build_brief(app)
     print_console_summary(app, title, content)
-    send_pushplus(title, content)
+    send_pushplus(title, content, positions=app.positions, watchlist_order=app.watchlist_order)
 
 
 if __name__ == "__main__":
