@@ -191,8 +191,9 @@ class ReadOnlyIBApp(EWrapper, EClient):
 def build_brief(app: ReadOnlyIBApp) -> tuple[str, str]:
     title = "持仓简报"
     lines = []
-    total_pnl = 0.0
-    total_cost = 0.0
+    total_market_value = 0.0
+    total_unrealized_pnl = 0.0
+    total_cost_basis = 0.0
     found_any = False
 
     for symbol in app.watchlist_order:
@@ -200,29 +201,37 @@ def build_brief(app: ReadOnlyIBApp) -> tuple[str, str]:
         if not row:
             continue
 
-        pnl = float(row.unrealizedPNL or 0.0)
-        avg_cost = float(row.averageCost or 0.0)
+        # IB原始数据
         position = float(row.position or 0.0)
-        cost_basis = avg_cost * position  # 成本基础 = 均价 × 持仓数量
-        pnl_pct = (pnl / cost_basis * 100) if cost_basis > 0 else 0  # 收益率
+        pnl = float(row.unrealizedPNL or 0.0)
+        market_value = float(row.marketValue or 0.0)
+        avg_cost = float(row.averageCost or 0.0)
+        market_price = float(row.marketPrice or 0.0)
 
-        total_pnl += pnl
-        total_cost += cost_basis
+        # 成本基础 = 均价 × 持仓数量
+        cost_basis = avg_cost * position
+
+        # 盈亏百分比
+        pnl_pct = (pnl / cost_basis * 100) if cost_basis > 0 else 0
+
+        total_unrealized_pnl += pnl
+        total_market_value += market_value
+        total_cost_basis += cost_basis
         found_any = True
         emoji = "📈" if pnl >= 0 else "📉"
 
         lines.append(
             f"{emoji} **{symbol}** 未实现盈亏：${pnl:,.2f} ({pnl_pct:+.2f}%)\n"
-            f"- 均价：${avg_cost:,.2f}\n"
+            f"- 均价：${avg_cost:,.2f}，现价：${market_price:,.2f}\n"
             f"- 成本基础：${cost_basis:,.2f}"
         )
 
     if not found_any:
         lines.append("当前短线池无持仓")
     else:
-        total_pnl_pct = (total_pnl / total_cost * 100) if total_cost > 0 else 0
-        lines.append(f"\n**💰 总成本基础：${total_cost:,.2f}**")
-        lines.append(f"**📊 总未实现盈亏：${total_pnl:,.2f} ({total_pnl_pct:+.2f}%)**")
+        total_pnl_pct = (total_unrealized_pnl / total_cost_basis * 100) if total_cost_basis > 0 else 0
+        lines.append(f"\n**💰 总成本基础：${total_cost_basis:,.2f}**")
+        lines.append(f"**📊 总未实现盈亏：${total_unrealized_pnl:,.2f} ({total_pnl_pct:+.2f}%)**")
 
     content = "\n\n".join(lines)
     return title, content
@@ -239,37 +248,57 @@ def _load_last_push() -> dict:
 
 
 def _save_last_push(summary: dict):
-    """保存本次推送的内容摘要"""
+    """保存本次推送的内容摘要，包含时间戳"""
     try:
-        LAST_PUSH_FILE.write_text(json.dumps(summary, ensure_ascii=False), encoding="utf-8")
+        data = {
+            "content": summary,
+            "last_push_time": time.time(),
+        }
+        LAST_PUSH_FILE.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
     except Exception:
         pass  # 保存失败不记录日志
 
 
 def _build_content_summary(positions: dict, watchlist_order: list) -> dict:
-    """构建内容摘要，用于对比是否变化"""
+    """构建内容摘要，用于对比是否变化（使用IB原始数据）"""
     summary = {}
     for symbol in watchlist_order:
         row = positions.get(symbol)
         if row:
-            # 只取关键字段，避免浮点精度问题
+            position = float(row.position or 0.0)
+            avg_cost = float(row.averageCost or 0.0)
+            cost_basis = avg_cost * position
             summary[symbol] = {
-                "position": round(float(row.position), 4),
-                "averageCost": round(float(row.averageCost or 0), 2),
+                "position": round(position, 4),
+                "averageCost": round(avg_cost, 2),
+                "costBasis": round(cost_basis, 2),
                 "unrealizedPNL": round(float(row.unrealizedPNL or 0), 2),
             }
     return summary
 
 
 def _has_content_changed(positions: dict, watchlist_order: list) -> bool:
-    """检查持仓内容是否发生变化"""
+    """检查持仓内容是否发生变化，或超过10分钟未推送"""
     current = _build_content_summary(positions, watchlist_order)
-    last = _load_last_push()
+    last_data = _load_last_push()
 
-    if not last:
+    if not last_data:
         return True
 
-    if current != last:
+    # 兼容旧格式（直接是内容摘要）
+    if "content" in last_data:
+        last_content = last_data.get("content", {})
+        last_push_time = last_data.get("last_push_time", 0)
+    else:
+        last_content = last_data
+        last_push_time = 0
+
+    # 内容变化，触发推送
+    if current != last_content:
+        return True
+
+    # 内容没变，但超过10分钟，强制推送一次
+    if time.time() - last_push_time > 600:  # 600秒 = 10分钟
         return True
 
     return False
@@ -311,13 +340,18 @@ def send_pushplus(title: str, content: str, positions: dict = None, watchlist_or
     try:
         with urllib.request.urlopen(req, timeout=15) as resp:
             body = resp.read().decode("utf-8", errors="replace")
-            # 推送成功后保存内容摘要
-            if positions is not None and watchlist_order is not None:
-                _save_last_push(_build_content_summary(positions, watchlist_order))
-            # 检查返回结果，非成功状态记录错误
             try:
                 result = json.loads(body)
-                if result.get("code") != 200:
+                code = result.get("code")
+                if code == 200:
+                    # 推送成功，保存缓存
+                    if positions is not None and watchlist_order is not None:
+                        _save_last_push(_build_content_summary(positions, watchlist_order))
+                elif code == 999:
+                    # 服务端说内容相同，也保存缓存（更新时间戳），避免死循环
+                    if positions is not None and watchlist_order is not None:
+                        _save_last_push(_build_content_summary(positions, watchlist_order))
+                else:
                     print(f"[ERROR] PushPlus 推送异常: {body}")
             except Exception:
                 pass
