@@ -117,7 +117,11 @@ class ReadOnlyIBApp(EWrapper, EClient):
         if not symbol:
             return
 
-        if symbol not in self.watchlist:
+        # 过滤：排除美债（BOND类型）和成本基础<=8000的持仓
+        cost_basis = float(averageCost) * float(position)
+        if contract.secType == "BOND":
+            return
+        if cost_basis <= 8000:
             return
 
         if abs(float(position)) < 1e-12:
@@ -196,11 +200,14 @@ def build_brief(app: ReadOnlyIBApp) -> tuple[str, str]:
     total_cost_basis = 0.0
     found_any = False
 
-    for symbol in app.watchlist_order:
-        row = app.positions.get(symbol)
-        if not row:
-            continue
+    # 按持仓市值排序，大市值在前
+    sorted_positions = sorted(
+        app.positions.items(),
+        key=lambda x: float(x[1].marketValue or 0.0),
+        reverse=True
+    )
 
+    for symbol, row in sorted_positions:
         # IB原始数据
         position = float(row.position or 0.0)
         pnl = float(row.unrealizedPNL or 0.0)
@@ -227,7 +234,7 @@ def build_brief(app: ReadOnlyIBApp) -> tuple[str, str]:
         )
 
     if not found_any:
-        lines.append("当前短线池无持仓")
+        lines.append("当前无符合条件的持仓（成本基础>$8000，不含美债）")
     else:
         total_pnl_pct = (total_unrealized_pnl / total_cost_basis * 100) if total_cost_basis > 0 else 0
         lines.append(f"\n**💰 总成本基础：${total_cost_basis:,.2f}**")
@@ -259,27 +266,25 @@ def _save_last_push(summary: dict):
         pass  # 保存失败不记录日志
 
 
-def _build_content_summary(positions: dict, watchlist_order: list) -> dict:
+def _build_content_summary(positions: dict) -> dict:
     """构建内容摘要，用于对比是否变化（使用IB原始数据）"""
     summary = {}
-    for symbol in watchlist_order:
-        row = positions.get(symbol)
-        if row:
-            position = float(row.position or 0.0)
-            avg_cost = float(row.averageCost or 0.0)
-            cost_basis = avg_cost * position
-            summary[symbol] = {
-                "position": round(position, 4),
-                "averageCost": round(avg_cost, 2),
-                "costBasis": round(cost_basis, 2),
-                "unrealizedPNL": round(float(row.unrealizedPNL or 0), 2),
-            }
+    for symbol, row in positions.items():
+        position = float(row.position or 0.0)
+        avg_cost = float(row.averageCost or 0.0)
+        cost_basis = avg_cost * position
+        summary[symbol] = {
+            "position": round(position, 4),
+            "averageCost": round(avg_cost, 2),
+            "costBasis": round(cost_basis, 2),
+            "unrealizedPNL": round(float(row.unrealizedPNL or 0), 2),
+        }
     return summary
 
 
-def _has_content_changed(positions: dict, watchlist_order: list) -> bool:
+def _has_content_changed(positions: dict) -> bool:
     """检查持仓内容是否发生变化，或超过10分钟未推送"""
-    current = _build_content_summary(positions, watchlist_order)
+    current = _build_content_summary(positions)
     last_data = _load_last_push()
 
     if not last_data:
@@ -304,7 +309,7 @@ def _has_content_changed(positions: dict, watchlist_order: list) -> bool:
     return False
 
 
-def send_pushplus(title: str, content: str, positions: dict = None, watchlist_order: list = None):
+def send_pushplus(title: str, content: str, positions: dict = None):
     """发送 PushPlus 推送，支持内容变化检测"""
     token = os.getenv("PUSHPLUS_TOKEN", "").strip()
     topic = os.getenv("PUSHPLUS_TOPIC", "").strip()
@@ -314,8 +319,8 @@ def send_pushplus(title: str, content: str, positions: dict = None, watchlist_or
         return
 
     # 内容变化检测
-    if positions is not None and watchlist_order is not None:
-        if not _has_content_changed(positions, watchlist_order):
+    if positions is not None:
+        if not _has_content_changed(positions):
             return
 
     url = "https://www.pushplus.plus/send"
@@ -345,12 +350,12 @@ def send_pushplus(title: str, content: str, positions: dict = None, watchlist_or
                 code = result.get("code")
                 if code == 200:
                     # 推送成功，保存缓存
-                    if positions is not None and watchlist_order is not None:
-                        _save_last_push(_build_content_summary(positions, watchlist_order))
+                    if positions is not None:
+                        _save_last_push(_build_content_summary(positions))
                 elif code == 999:
                     # 服务端说内容相同，也保存缓存（更新时间戳），避免死循环
-                    if positions is not None and watchlist_order is not None:
-                        _save_last_push(_build_content_summary(positions, watchlist_order))
+                    if positions is not None:
+                        _save_last_push(_build_content_summary(positions))
                 else:
                     print(f"[ERROR] PushPlus 推送异常: {body}")
             except Exception:
@@ -385,6 +390,14 @@ def run_readonly_report(
             break
         time.sleep(0.5)
 
+    # 连接失败或数据未就绪，直接退出不推送
+    if not app._portfolio_done:
+        try:
+            app.disconnect()
+        except Exception:
+            pass
+        return
+
     if app.account:
         try:
             app.reqAccountUpdates(False, app.account)
@@ -407,7 +420,7 @@ def run_readonly_report(
 
     title, content = build_brief(app)
     print_console_summary(app, title, content)
-    send_pushplus(title, content, positions=app.positions, watchlist_order=app.watchlist_order)
+    send_pushplus(title, content, positions=app.positions)
 
 
 if __name__ == "__main__":
