@@ -208,7 +208,6 @@ def build_brief(app: ReadOnlyIBApp) -> tuple[str, str]:
     )
 
     for symbol, row in sorted_positions:
-        # IB原始数据
         position = float(row.position or 0.0)
         pnl = float(row.unrealizedPNL or 0.0)
         market_value = float(row.marketValue or 0.0)
@@ -283,7 +282,7 @@ def _build_content_summary(positions: dict) -> dict:
 
 
 def _has_content_changed(positions: dict) -> bool:
-    """检查持仓内容是否发生变化，或超过10分钟未推送"""
+    """检查持仓内容是否发生变化，或超过60秒未推送"""
     current = _build_content_summary(positions)
     last_data = _load_last_push()
 
@@ -302,8 +301,8 @@ def _has_content_changed(positions: dict) -> bool:
     if current != last_content:
         return True
 
-    # 内容没变，但超过10分钟，强制推送一次
-    if time.time() - last_push_time > 600:  # 600秒 = 10分钟
+    # 内容没变，但超过5分钟，强制推送一次
+    if time.time() - last_push_time > 300:  # 300秒 = 5分钟
         return True
 
     return False
