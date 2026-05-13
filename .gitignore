@@ -24,3 +24,7 @@ bin-release/
 /.venv/
 /.vscode/
 __pycache__/
+.env
+ibkr/.env
+ibkr/.last_push.json
+ibkr/*.log

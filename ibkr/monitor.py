@@ -1,21 +1,53 @@
 import json
 import os
+import http.client
+import datetime as _dt
 import threading
 import time
+import urllib.parse
 import urllib.request
 from dataclasses import dataclass
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
+from typing import Callable
 from typing import Optional
+import xml.etree.ElementTree as ET
 
 from ibapi.client import EClient
 from ibapi.contract import Contract
 from ibapi.wrapper import EWrapper
 
 
+MODULE_DIR = Path(__file__).resolve().parent
+PROJECT_ROOT = MODULE_DIR.parent
+
+
+def _load_env_file(path: Path) -> None:
+    if not path.exists():
+        return
+
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip().strip('"').strip("'")
+        if key and key not in os.environ:
+            os.environ[key] = value
+
+
+for env_file in (PROJECT_ROOT / ".env", MODULE_DIR / ".env"):
+    _load_env_file(env_file)
+
+
 WATCHLIST_FILE = os.getenv("WATCHLIST_FILE", "watchlist_short.json")
+REALIZED_PNL_START_DATE = os.getenv("IBKR_REALIZED_PNL_START_DATE", "20260410")
+REALIZED_PNL_END_DATE = os.getenv("IBKR_REALIZED_PNL_END_DATE", "")
+FLEX_BASE_URL = "https://ndcdyn.interactivebrokers.com/AccountManagement/FlexWebService"
 
 # 上次推送内容缓存文件（用于对比是否变化）
-LAST_PUSH_FILE = Path(__file__).parent / ".last_push.json"
+LAST_PUSH_FILE = MODULE_DIR / ".last_push.json"
 
 
 @dataclass
@@ -32,6 +64,25 @@ class PositionRow:
     unrealizedPNL: float
     realizedPNL: float
     conId: int = 0
+
+
+@dataclass(frozen=True)
+class RealizedPnlSummary:
+    status: str
+    start_date: str
+    values_by_currency: dict[str, Decimal]
+    error: str = ""
+
+    @property
+    def cache_key(self) -> dict:
+        return {
+            "status": self.status,
+            "startDate": self.start_date,
+            "values": {
+                currency: str(amount.quantize(Decimal("0.01")))
+                for currency, amount in sorted(self.values_by_currency.items())
+            },
+        }
 
 
 def load_watchlist(path: str) -> list[str]:
@@ -61,6 +112,281 @@ def load_watchlist(path: str) -> list[str]:
             seen.add(s)
             uniq.append(s)
     return uniq
+
+
+def _format_date_zh(date_value: str) -> str:
+    if len(date_value) == 8 and date_value.isdigit():
+        return f"{date_value[:4]}年{int(date_value[4:6])}月{int(date_value[6:])}日"
+    return date_value
+
+
+def _parse_money(value: str | None) -> Decimal | None:
+    if value is None:
+        return None
+    cleaned = value.strip().replace(",", "")
+    if not cleaned:
+        return None
+    try:
+        return Decimal(cleaned)
+    except InvalidOperation:
+        return None
+
+
+def _first_attr(node: ET.Element, names: tuple[str, ...]) -> str | None:
+    lower_attrs = {key.lower(): value for key, value in node.attrib.items()}
+    for name in names:
+        value = lower_attrs.get(name.lower())
+        if value not in (None, ""):
+            return value
+    return None
+
+
+def _parse_flex_date(value: str | None) -> str | None:
+    if not value:
+        return None
+    digits = "".join(ch for ch in value if ch.isdigit())
+    if len(digits) >= 8:
+        return digits[:8]
+    return None
+
+
+def _default_realized_pnl_end_date() -> str:
+    return (_dt.date.today() - _dt.timedelta(days=1)).strftime("%Y%m%d")
+
+
+def parse_realized_pnl_from_flex_xml(xml_text: str, start_date: str) -> RealizedPnlSummary:
+    root = ET.fromstring(xml_text)
+    error_node = root.find(".//ErrorMessage")
+    if error_node is not None and error_node.text:
+        raise RuntimeError(error_node.text.strip())
+
+    summary_result = _parse_realized_pnl_summary_rows(root, start_date)
+    if summary_result is not None:
+        return summary_result
+
+    totals: dict[str, Decimal] = {}
+    trade_count = 0
+    seen_trade = False
+    for trade in root.iter():
+        if trade.tag.split("}")[-1].lower() != "trade":
+            continue
+        seen_trade = True
+
+        trade_date = _parse_flex_date(
+            _first_attr(trade, ("dateTime", "tradeDate", "reportDate", "settleDate"))
+        )
+        if trade_date and trade_date < start_date:
+            continue
+
+        realized_pnl = _parse_money(
+            _first_attr(
+                trade,
+                (
+                    "realizedPNL",
+                    "realizedPnl",
+                    "realizedPL",
+                    "realizedP/L",
+                    "fifoPnlRealized",
+                ),
+            )
+        )
+        if realized_pnl is None:
+            continue
+
+        currency = (_first_attr(trade, ("currency", "ibCommissionCurrency")) or "UNKNOWN").upper()
+        fx_rate = _parse_money(_first_attr(trade, ("fxRateToBase", "fxRateToBaseCurrency")))
+        base_currency = (
+            _first_attr(trade, ("baseCurrency", "reportingCurrency"))
+            or root.attrib.get("currency")
+            or ""
+        ).upper()
+        if fx_rate is not None and base_currency:
+            currency = base_currency
+            realized_pnl *= fx_rate
+
+        totals[currency] = totals.get(currency, Decimal("0")) + realized_pnl
+        trade_count += 1
+
+    if seen_trade and trade_count == 0:
+        raise RuntimeError("Flex Trades section did not contain Realized PNL fields")
+    if trade_count == 0:
+        return RealizedPnlSummary(status="ok", start_date=start_date, values_by_currency={})
+    return RealizedPnlSummary(status="ok", start_date=start_date, values_by_currency=totals)
+
+
+def _parse_realized_pnl_summary_rows(
+    root: ET.Element,
+    start_date: str,
+) -> RealizedPnlSummary | None:
+    totals: dict[str, Decimal] = {}
+    found_rows = 0
+    for node in root.iter():
+        tag_name = node.tag.split("}")[-1].lower()
+        if tag_name == "trade":
+            continue
+
+        realized_pnl = _parse_money(
+            _first_attr(
+                node,
+                (
+                    "totalRealizedPNL",
+                    "totalRealizedPnl",
+                    "totalRealizedPL",
+                    "totalRealizedP/L",
+                    "realizedTotal",
+                    "realizedPNL",
+                    "realizedPnl",
+                ),
+            )
+        )
+        if realized_pnl is None:
+            continue
+
+        row_label = (
+            _first_attr(node, ("symbol", "assetClass", "description"))
+            or node.attrib.get("levelOfDetail")
+            or ""
+        ).strip().lower()
+        if "total" in row_label or "all asset" in row_label:
+            continue
+
+        currency = (
+            _first_attr(node, ("currency", "baseCurrency", "reportingCurrency"))
+            or root.attrib.get("currency")
+            or "USD"
+        ).upper()
+        totals[currency] = totals.get(currency, Decimal("0")) + realized_pnl
+        found_rows += 1
+
+    if found_rows == 0:
+        return None
+    return RealizedPnlSummary(status="ok", start_date=start_date, values_by_currency=totals)
+
+
+def _flex_request(url: str, timeout: int = 20) -> str:
+    req = urllib.request.Request(
+        url,
+        headers={"User-Agent": "python-fund-ibkr-monitor/1.0"},
+        method="GET",
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        try:
+            body = resp.read()
+        except http.client.IncompleteRead as exc:
+            body = exc.partial
+            text = body.decode("utf-8", errors="replace")
+            if not _looks_like_complete_flex_xml(text):
+                raise
+            return text
+        return body.decode("utf-8", errors="replace")
+
+
+def _flex_url(path: str, params: dict[str, str]) -> str:
+    return f"{FLEX_BASE_URL}/{path}?{urllib.parse.urlencode(params)}"
+
+
+def _looks_like_complete_flex_xml(xml_text: str) -> bool:
+    stripped = xml_text.rstrip()
+    return stripped.endswith("</FlexQueryResponse>") or stripped.endswith("</FlexStatementResponse>")
+
+
+def _request_with_retries(
+    request_call: Callable[[], str],
+    sleep_fn: Callable[[float], None],
+    attempts: int = 3,
+) -> str:
+    last_error: Exception | None = None
+    for attempt in range(attempts):
+        try:
+            return request_call()
+        except (urllib.error.URLError, http.client.HTTPException, TimeoutError, OSError) as exc:
+            last_error = exc
+            if attempt == attempts - 1:
+                break
+            sleep_fn(2)
+    if last_error is not None:
+        raise last_error
+    raise RuntimeError("Flex request failed")
+
+
+def _extract_flex_reference(response_xml: str) -> str:
+    root = ET.fromstring(response_xml)
+    status = root.findtext(".//Status")
+    if status and status.lower() != "success":
+        code = root.findtext(".//ErrorCode") or "unknown"
+        message = root.findtext(".//ErrorMessage") or "Flex request failed"
+        raise RuntimeError(f"Flex SendRequest failed: {code} {message}")
+
+    reference_code = root.findtext(".//ReferenceCode")
+    if not reference_code:
+        raise RuntimeError("Flex SendRequest did not return ReferenceCode")
+    return reference_code.strip()
+
+
+def fetch_realized_pnl_summary(
+    start_date: str = REALIZED_PNL_START_DATE,
+    end_date: str = REALIZED_PNL_END_DATE,
+    request_fn: Callable[[str], str] = _flex_request,
+    sleep_fn: Callable[[float], None] = time.sleep,
+    max_attempts: int = 5,
+) -> RealizedPnlSummary:
+    token = os.getenv("IBKR_FLEX_TOKEN", "").strip()
+    query_id = os.getenv("IBKR_FLEX_QUERY_ID", "").strip()
+    if not token or not query_id:
+        print("[WARN] 未设置 IBKR_FLEX_TOKEN 或 IBKR_FLEX_QUERY_ID，跳过已实现盈亏统计")
+        return RealizedPnlSummary(status="unconfigured", start_date=start_date, values_by_currency={})
+
+    try:
+        if not end_date:
+            end_date = _default_realized_pnl_end_date()
+        send_xml = _request_with_retries(
+            lambda: request_fn(
+                _flex_url(
+                    "SendRequest",
+                    {"t": token, "q": query_id, "fd": start_date, "td": end_date, "v": "3"},
+                )
+            ),
+            sleep_fn,
+        )
+        reference_code = _extract_flex_reference(send_xml)
+        statement_url = _flex_url("GetStatement", {"t": token, "q": reference_code, "v": "3"})
+        sleep_fn(20)
+
+        last_error = ""
+        for attempt in range(max_attempts):
+            statement_xml = _request_with_retries(lambda: request_fn(statement_url), sleep_fn)
+            try:
+                return parse_realized_pnl_from_flex_xml(statement_xml, start_date)
+            except RuntimeError as exc:
+                last_error = str(exc)
+                if attempt == max_attempts - 1:
+                    break
+                sleep_fn(2)
+        raise RuntimeError(last_error or "Flex statement was not available")
+    except Exception as exc:
+        print(f"[ERROR] 获取 Flex 已实现盈亏失败: {exc}")
+        return RealizedPnlSummary(
+            status="error",
+            start_date=start_date,
+            values_by_currency={},
+            error=str(exc),
+        )
+
+
+def format_realized_pnl_line(summary: RealizedPnlSummary) -> str:
+    date_label = _format_date_zh(summary.start_date)
+    if summary.status == "unconfigured":
+        return f"**自 {date_label} 以来已实现全部盈亏：未配置 Flex**"
+    if summary.status == "error":
+        return f"**自 {date_label} 以来已实现全部盈亏：获取失败**"
+    if not summary.values_by_currency:
+        return f"**自 {date_label} 以来已实现全部盈亏：$0.00**"
+
+    parts = []
+    for currency, amount in sorted(summary.values_by_currency.items()):
+        symbol = "$" if currency in ("USD", "UNKNOWN") else f"{currency} "
+        parts.append(f"{symbol}{amount:,.2f}")
+    return f"**自 {date_label} 以来已实现全部盈亏：{', '.join(parts)}**"
 
 
 class ReadOnlyIBApp(EWrapper, EClient):
@@ -192,7 +518,7 @@ class ReadOnlyIBApp(EWrapper, EClient):
         print(f"[ERROR] reqId={reqId}, code={errorCode}, msg={errorString}")
 
 
-def build_brief(app: ReadOnlyIBApp) -> tuple[str, str]:
+def build_brief(app: ReadOnlyIBApp, realized_pnl: RealizedPnlSummary | None = None) -> tuple[str, str]:
     title = "持仓简报"
     lines = []
     total_market_value = 0.0
@@ -239,6 +565,9 @@ def build_brief(app: ReadOnlyIBApp) -> tuple[str, str]:
         lines.append(f"\n**💰 总成本基础：${total_cost_basis:,.2f}**")
         lines.append(f"**📊 总未实现盈亏：${total_unrealized_pnl:,.2f} ({total_pnl_pct:+.2f}%)**")
 
+    if realized_pnl is not None:
+        lines.append(format_realized_pnl_line(realized_pnl))
+
     content = "\n\n".join(lines)
     return title, content
 
@@ -265,7 +594,7 @@ def _save_last_push(summary: dict):
         pass  # 保存失败不记录日志
 
 
-def _build_content_summary(positions: dict) -> dict:
+def _build_content_summary(positions: dict, realized_pnl: RealizedPnlSummary | None = None) -> dict:
     """构建内容摘要，用于对比是否变化（使用IB原始数据）"""
     summary = {}
     for symbol, row in positions.items():
@@ -278,12 +607,14 @@ def _build_content_summary(positions: dict) -> dict:
             "costBasis": round(cost_basis, 2),
             "unrealizedPNL": round(float(row.unrealizedPNL or 0), 2),
         }
+    if realized_pnl is not None:
+        summary["_realizedPnlSince"] = realized_pnl.cache_key
     return summary
 
 
-def _has_content_changed(positions: dict) -> bool:
+def _has_content_changed(positions: dict, realized_pnl: RealizedPnlSummary | None = None) -> bool:
     """检查持仓内容是否发生变化，或超过60秒未推送"""
-    current = _build_content_summary(positions)
+    current = _build_content_summary(positions, realized_pnl)
     last_data = _load_last_push()
 
     if not last_data:
@@ -308,7 +639,12 @@ def _has_content_changed(positions: dict) -> bool:
     return False
 
 
-def send_pushplus(title: str, content: str, positions: dict = None):
+def send_pushplus(
+    title: str,
+    content: str,
+    positions: dict = None,
+    realized_pnl: RealizedPnlSummary | None = None,
+):
     """发送 PushPlus 推送，支持内容变化检测"""
     token = os.getenv("PUSHPLUS_TOKEN", "").strip()
     topic = os.getenv("PUSHPLUS_TOPIC", "").strip()
@@ -319,7 +655,7 @@ def send_pushplus(title: str, content: str, positions: dict = None):
 
     # 内容变化检测
     if positions is not None:
-        if not _has_content_changed(positions):
+        if not _has_content_changed(positions, realized_pnl):
             return
 
     url = "https://www.pushplus.plus/send"
@@ -350,11 +686,11 @@ def send_pushplus(title: str, content: str, positions: dict = None):
                 if code == 200:
                     # 推送成功，保存缓存
                     if positions is not None:
-                        _save_last_push(_build_content_summary(positions))
+                        _save_last_push(_build_content_summary(positions, realized_pnl))
                 elif code == 999:
                     # 服务端说内容相同，也保存缓存（更新时间戳），避免死循环
                     if positions is not None:
-                        _save_last_push(_build_content_summary(positions))
+                        _save_last_push(_build_content_summary(positions, realized_pnl))
                 else:
                     print(f"[ERROR] PushPlus 推送异常: {body}")
             except Exception:
@@ -417,9 +753,10 @@ def run_readonly_report(
 
     app.disconnect()
 
-    title, content = build_brief(app)
+    realized_pnl = fetch_realized_pnl_summary()
+    title, content = build_brief(app, realized_pnl)
     print_console_summary(app, title, content)
-    send_pushplus(title, content, positions=app.positions)
+    send_pushplus(title, content, positions=app.positions, realized_pnl=realized_pnl)
 
 
 if __name__ == "__main__":
